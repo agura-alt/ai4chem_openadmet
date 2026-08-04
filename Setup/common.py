@@ -35,13 +35,19 @@ __version__ = "1.0"
 # =========================================================================
 # SETUP 1 of 3 -- data sources.
 #
-# Primary source is a pair of CSVs in the shared Drive folder, staged once by
-# instructor/fetch_data.py. No network, no HuggingFace, no surprises on the
-# day. The Hub is only a fallback if those files are missing.
+# Primary source is a pair of CSVs checked into this repo under Data/, or
+# staged in the shared Drive folder by instructor/fetch_data.py. No network,
+# no HuggingFace, no surprises on the day. The Hub is only a fallback if
+# those files are missing.
 # =========================================================================
 
-TRAIN_CSV = "expansion_train.csv"
-TEST_CSV = "expansion_test_blinded.csv"
+TRAIN_CSV = "expansion_data_train.csv"
+TEST_CSV = "expansion_data_test_blinded.csv"
+
+# This file lives in <repo>/Setup/common.py, next to <repo>/Data and
+# <repo>/Notebooks. Anchor on __file__ so the cwd doesn't matter.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_DATA_DIR = os.path.join(REPO_ROOT, "Data")
 
 TRAIN_REPO = "openadmet/openadmet-expansionrx-challenge-train-data"
 TEST_REPO = "openadmet/openadmet-expansionrx-challenge-test-data-blinded"
@@ -215,9 +221,39 @@ def _read_repo_csv(repos: list[str], prefer: str) -> pd.DataFrame:
     )
 
 
+def data_dirs() -> list[str]:
+    """Directories searched for the challenge CSVs, in priority order."""
+    dirs = []
+    override = os.environ.get("ADMET_DATA_DIR", "")
+    if override:
+        dirs.append(override)
+    dirs += [
+        REPO_DATA_DIR,                            # <repo>/Data  (this layout)
+        os.path.join(MATERIALS_DIR, "data"),      # shared Drive folder
+        os.path.join(os.getcwd(), "Data"),        # Data/ under the cwd
+        os.getcwd(),                              # next to the notebook
+    ]
+    seen, out = set(), []
+    for d in dirs:
+        d = os.path.abspath(d)
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
 def data_path(filename: str) -> str:
-    """Where a staged CSV should be: <shared Drive folder>/data/<filename>."""
-    return os.path.join(MATERIALS_DIR, "data", filename)
+    """Full path to a staged CSV.
+
+    Returns the first location that actually holds the file; if none do,
+    returns the preferred location (<repo>/Data/<filename>) so the caller
+    can report a sensible path in its error message.
+    """
+    for d in data_dirs():
+        candidate = os.path.join(d, filename)
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.join(REPO_DATA_DIR, filename)
 
 
 def _load_raw(kind: str) -> pd.DataFrame:
@@ -230,9 +266,8 @@ def _load_raw(kind: str) -> pd.DataFrame:
     local = data_path(filename)
     if os.path.exists(local):
         return pd.read_csv(local)
-    if os.path.exists(filename):          # a copy sitting next to the notebook
-        return pd.read_csv(filename)
-    print(f"{filename} not found locally, falling back to HuggingFace...")
+    print(f"{filename} not found in {', '.join(data_dirs())}; "
+          "falling back to HuggingFace...")
     return _read_repo_csv(repos, hint)
 
 
@@ -266,17 +301,22 @@ def _read_table(src: str) -> pd.DataFrame:
 def load_artifact(name: str) -> pd.DataFrame:
     """Load a pre-built artifact (descriptors, embeddings, external data).
 
-    Looks in the shared Drive folder first, then an optional HTTP fallback.
-    These are precomputed so that a dead Colab runtime never costs you an hour.
+    Looks in this repo and the shared Drive folder first, then an optional
+    HTTP fallback. These are precomputed so that a dead Colab runtime never
+    costs you an hour.
     """
-    local = os.path.join(MATERIALS_DIR, "artifacts", name)
-    if os.path.exists(local):
-        return _read_table(local)
+    looked = []
+    for d in data_dirs():
+        for candidate in (os.path.join(d, "artifacts", name),
+                          os.path.join(d, name)):
+            looked.append(candidate)
+            if os.path.exists(candidate):
+                return _read_table(candidate)
     if ARTIFACT_BASE:
         return _read_table(ARTIFACT_BASE.rstrip("/") + "/" + name)
     raise RuntimeError(
         f"Artifact '{name}' not found.\n"
-        f"Looked in: {local}\n"
+        "Looked in:\n  " + "\n  ".join(looked) + "\n"
         "Ask an instructor, or compute it yourself with the (slower) code in "
         "the notebook."
     )
