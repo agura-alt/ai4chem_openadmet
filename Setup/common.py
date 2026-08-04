@@ -18,6 +18,7 @@ INSTRUCTOR: three things to configure before the event. Search for SETUP.
 
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import os
@@ -73,10 +74,16 @@ ARTIFACT_BASE = os.environ.get("ADMET_ARTIFACT_BASE", "")
 # =========================================================================
 
 LEADERBOARD_URL = os.environ.get("ADMET_LEADERBOARD_URL", "")
-SHARED_DIR = os.environ.get("ADMET_SHARED_DIR", "/content/drive/MyDrive/admet_hackathon_submissions")
+SHARED_DIR = os.environ.get("ADMET_SHARED_DIR", "/content/drive/Shareddrives/AI4ChemicalSciences_OpenADMET_TeamFolders")
+
+# Layout inside SHARED_DIR: one folder per pair, holding that pair's
+# submissions. setup() creates it.
+#
+#   <SHARED_DIR>/<pair>/     <- every submission this pair writes
+#
 
 # SETUP 3 of 3 -- how many leaderboard submissions each pair gets for the day.
-SUBMISSION_BUDGET = 6
+SUBMISSION_BUDGET = 10
 
 # =========================================================================
 # Endpoints
@@ -114,7 +121,7 @@ ENDPOINT_FAMILIES = {
 # Workspace
 # =========================================================================
 
-_STATE = {"pair": None, "workdir": None}
+_STATE = {"pair": None, "workdir": None, "submissions_dir": ""}
 
 
 def in_colab() -> bool:
@@ -156,12 +163,49 @@ def setup(pair: str, mount_drive: bool = True, quiet: bool = False) -> str:
     os.makedirs(os.path.join(workdir, "predictions"), exist_ok=True)
     _STATE["pair"] = pair
     _STATE["workdir"] = workdir
+
+    shared = _make_team_folder(pair)
+
     if not quiet:
         print(f"pair      : {pair}")
         print(f"workspace : {workdir}")
+        if shared:
+            print(f"submissions: {shared}")
         n = len(list_predictions())
         print(f"prediction files on hand: {n}")
     return workdir
+
+
+def _make_team_folder(pair: str) -> str:
+    """Create this pair's folder in the shared Drive folder.
+
+    Best-effort: on a laptop with no Drive mounted, or if the shared folder
+    is read-only, we warn and carry on. Nothing else in the notebook needs
+    it to exist until the pair actually submits.
+
+    Returns the folder path, or "" if it could not be created.
+    """
+    if not SHARED_DIR:
+        return ""
+    d = os.path.join(SHARED_DIR, pair)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError as exc:
+        warnings.warn(
+            f"Could not create your folder at {d} ({exc}). Submissions will "
+            "stay in your local workspace until the shared folder is "
+            "reachable -- check that Drive is mounted.")
+        return ""
+    _STATE["submissions_dir"] = d
+    return d
+
+
+def submissions_dir(create: bool = True) -> str:
+    """This pair's folder in the shared Drive folder: <SHARED_DIR>/<pair>."""
+    d = os.path.join(SHARED_DIR, pair_name())
+    if create:
+        os.makedirs(d, exist_ok=True)
+    return d
 
 
 def workdir() -> str:
@@ -526,6 +570,29 @@ SPLITTERS = {
     "similarity": similarity_split,
 }
 
+# Which splitter load_split() falls back to when no split has been saved.
+# Override per-call with load_split(default="random"), for the whole session
+# with common.DEFAULT_SPLIT = "random", or via the ADMET_DEFAULT_SPLIT env var.
+DEFAULT_SPLIT = os.environ.get("ADMET_DEFAULT_SPLIT", "temporal")
+DEFAULT_SPLIT_SEED = int(os.environ.get("ADMET_DEFAULT_SPLIT_SEED", "0"))
+DEFAULT_FRAC_VAL = 0.2
+
+
+def make_split(df: pd.DataFrame, method: str, frac_val: float = DEFAULT_FRAC_VAL,
+               seed: int = DEFAULT_SPLIT_SEED) -> pd.Series:
+    """Run a named splitter, passing only the kwargs it actually accepts."""
+    try:
+        fn = SPLITTERS[method]
+    except KeyError:
+        raise ValueError(
+            f"Unknown split method {method!r}. "
+            f"Pick one of: {', '.join(sorted(SPLITTERS))}"
+        ) from None
+    kwargs = {"frac_val": frac_val}
+    if "seed" in inspect.signature(fn).parameters:
+        kwargs["seed"] = seed
+    return fn(df, **kwargs)
+
 
 def save_split(split: pd.Series, df: pd.DataFrame, method: str,
                rationale: str = "", val_score: float | None = None) -> str:
@@ -559,15 +626,33 @@ def split_metadata() -> dict:
         with open(os.path.join(workdir(), "split_meta.json")) as fh:
             return json.load(fh)
     except Exception:
-        return {"method": "temporal (default)", "rationale": "", "val_score": None}
+        return {"method": f"{DEFAULT_SPLIT} (default)", "rationale": "",
+                "val_score": None}
 
 
-def load_split(df: pd.DataFrame | None = None, verbose: bool = True):
-    """Load this pair's saved split, or fall back to the default temporal one.
+def load_split(df: pd.DataFrame | None = None, verbose: bool = True,
+               default: str | None = None,
+               frac_val: float = DEFAULT_FRAC_VAL,
+               seed: int | None = None,
+               name: str | None = None):
+    """Load this pair's saved split, or fall back to a freshly computed one.
+
+    `default` (alias: `name`) picks the fallback splitter -- "random",
+    "temporal", "scaffold" or "similarity". It only applies when no split has
+    been saved; a saved split always wins. Leave it None for common.DEFAULT_SPLIT.
 
     Never raises just because you skipped 02_validation.
     Returns (fold_series_aligned_to_df, metadata_dict).
     """
+    if default is None:
+        default = name                     # notebooks call load_split(name=...)
+    method = DEFAULT_SPLIT if default is None else default
+    if method not in SPLITTERS:                    # fail before the data load
+        raise ValueError(
+            f"Unknown split method {method!r}. "
+            f"Pick one of: {', '.join(sorted(SPLITTERS))}")
+    seed = DEFAULT_SPLIT_SEED if seed is None else seed
+
     df = load_train() if df is None else df
     path = os.path.join(workdir(), "split.csv")
     if os.path.exists(path):
@@ -582,11 +667,16 @@ def load_split(df: pd.DataFrame | None = None, verbose: bool = True):
             print(f"using YOUR split: {meta.get('method')} "
                   f"({(fold == 'val').sum()} val molecules)")
         return fold.reset_index(drop=True), meta
-    fold = temporal_split(df)
+    fold = make_split(df, method, frac_val=frac_val, seed=seed)
     if verbose:
-        print("no saved split found -- using the default temporal split. "
+        print(f"no saved split found -- using the default {method} split "
+              f"({(fold == 'val').sum()} val molecules). "
               "Run 02_validation.ipynb to choose your own.")
-    return fold, {"method": "temporal (default)", "rationale": "", "val_score": None}
+    meta = {"method": f"{method} (default)", "rationale": "", "val_score": None,
+            "frac_val": frac_val}
+    if "seed" in inspect.signature(SPLITTERS[method]).parameters:
+        meta["seed"] = seed
+    return fold.reset_index(drop=True), meta
 
 
 # =========================================================================
@@ -678,9 +768,52 @@ def submissions_used() -> int:
         return sum(1 for line in fh if line.strip())
 
 
-def submit(pred: pd.DataFrame, expected_ma_rae: float, why: str,
-           warmup: bool = False) -> None:
-    """Send predictions to the leaderboard.
+#: metadata lines at the top of a submission start with this.
+META_PREFIX = "#"
+
+
+def write_submission(path: str, pred: pd.DataFrame, record: dict) -> str:
+    """Write ONE file: metadata as comment lines, then the predictions.
+
+        # pair: beetroot
+        # submitted_at: 20260804T221531Z
+        ...
+        Molecule Name,LogD,LogS,...
+
+    Every metadata line starts with '#', so the whole thing still reads as a
+    normal CSV: pd.read_csv(path, comment='#').
+    """
+    with open(path, "w") as fh:
+        fh.write(_submission_text(pred, record))
+    return path
+
+
+def _submission_text(pred: pd.DataFrame, record: dict) -> str:
+    # newlines in a value would break the one-line-per-key format
+    header = "".join(f"{META_PREFIX} {k}: {str(v).replace(chr(10), ' ')}\n"
+                     for k, v in record.items())
+    buf = io.StringIO()
+    pred.to_csv(buf, index=False)
+    return header + buf.getvalue()
+
+
+def read_submission(path: str) -> tuple[pd.DataFrame, dict]:
+    """Inverse of write_submission: (predictions, metadata)."""
+    record = {}
+    with open(path) as fh:
+        for line in fh:
+            if not line.startswith(META_PREFIX):
+                break
+            key, _, value = line[len(META_PREFIX):].strip().partition(":")
+            record[key.strip()] = value.strip()
+    return pd.read_csv(path, comment=META_PREFIX), record
+
+
+def prepare_submission(pred: pd.DataFrame, expected_ma_rae: float, why: str) -> str:
+    """Write one submission file into your folder in the shared Drive.
+
+    Returns the path. Writing the file is all this does -- to have it scored,
+    drag it into the Scored folder (see 00_start_here).
 
     You get SUBMISSION_BUDGET submissions for the whole day. That is
     deliberate: with a budget this small you cannot use the leaderboard as a
@@ -690,11 +823,9 @@ def submit(pred: pd.DataFrame, expected_ma_rae: float, why: str,
                       This feeds the calibration leaderboard, which ranks
                       pairs on how close that guess was -- not on the score.
     why             : one sentence on what changed since your last submission.
-    warmup          : the null-model submission from 00_start_here. Free --
-                      it does not spend any of your budget.
     """
     used = submissions_used()
-    if not warmup and used >= SUBMISSION_BUDGET:
+    if used >= SUBMISSION_BUDGET:
         raise RuntimeError(
             f"You have used all {SUBMISSION_BUDGET} submissions. Your best "
             "already-submitted entry still counts -- go write your report.")
@@ -710,39 +841,54 @@ def submit(pred: pd.DataFrame, expected_ma_rae: float, why: str,
     record = {"pair": pair_name(), "submitted_at": stamp,
               "expected_ma_rae": float(expected_ma_rae), "why": why.strip(),
               "split": meta.get("method"), "n": int(len(pred)),
-              "attempt": 0 if warmup else used + 1, "warmup": bool(warmup)}
+              "attempt": used + 1}
 
-    delivered = False
-    if LEADERBOARD_URL:
-        try:
-            import requests
-            buf = io.StringIO()
-            pred.to_csv(buf, index=False)
-            r = requests.post(LEADERBOARD_URL,
-                              files={"predictions": (f"{pair_name()}.csv", buf.getvalue())},
-                              data={"meta": json.dumps(record)}, timeout=60)
-            r.raise_for_status()
-            delivered = True
-            print(r.text[:500])
-        except Exception as exc:
-            warnings.warn(f"Leaderboard POST failed ({exc}); falling back to shared folder.")
-    if not delivered:
-        os.makedirs(SHARED_DIR, exist_ok=True)
-        tag = "warmup" if warmup else f"attempt{used + 1}"
-        stem = f"{pair_name()}__{stamp}__{tag}"
-        pred.to_csv(os.path.join(SHARED_DIR, stem + ".csv"), index=False)
-        with open(os.path.join(SHARED_DIR, stem + ".json"), "w") as fh:
-            json.dump(record, fh, indent=2)
-        print(f"submitted to the shared folder as {stem}")
+    stem = f"{pair_name()}__{stamp}__attempt{used + 1}"
+    path = os.path.join(submissions_dir(), stem + ".csv")
+    write_submission(path, pred, record)
+    print(f"wrote your submission file:\n  {path}")
 
-    if warmup:
-        print("warm-up submission -- this one is free, your budget is untouched.")
-        return
     with open(os.path.join(workdir(), "submissions.jsonl"), "a") as fh:
         fh.write(json.dumps(record) + "\n")
     left = SUBMISSION_BUDGET - (used + 1)
     print(f"submission {used + 1} of {SUBMISSION_BUDGET}. {left} left.")
     print(f"you predicted MA-RAE = {expected_ma_rae:.3f}. Write that on slide 3.")
+    return path
+
+
+def submit(pred: pd.DataFrame, expected_ma_rae: float, why: str) -> str:
+    """prepare_submission(), plus a POST if a leaderboard endpoint is configured.
+
+    With no LEADERBOARD_URL set -- the drag-it-across workflow -- this is
+    exactly prepare_submission().
+    """
+    path = prepare_submission(pred, expected_ma_rae, why)
+    if LEADERBOARD_URL:
+        try:
+            import requests
+            with open(path) as fh:
+                body = fh.read()          # same single file, metadata included
+            r = requests.post(LEADERBOARD_URL,
+                              files={"predictions": (os.path.basename(path), body)},
+                              timeout=60)
+            r.raise_for_status()
+            print(r.text[:500])
+        except Exception as exc:
+            warnings.warn(
+                f"Leaderboard POST failed ({exc}). Your file is still in your "
+                f"shared-drive folder: {path}")
+    return path
+
+
+def download_submission(path: str) -> None:
+    """Download a submission file to your laptop (Colab only)."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    try:
+        from google.colab import files  # type: ignore
+        files.download(path)
+    except ImportError:
+        print(f"Not in Colab -- your file is already on this machine:\n  {path}")
 
 
 # =========================================================================
