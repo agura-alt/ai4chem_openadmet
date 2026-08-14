@@ -35,6 +35,8 @@ Rules, all deliberate:
   * calibration ranks by their smallest |expected - actual|, chosen
     independently -- it may point at a different submission than accuracy.
     A pair with no expected score on any submission is not ranked at all.
+    Constant baselines are excluded here: flat predictions calibrate
+    near-perfectly by construction, so they would own the tab.
 
 The ledger (a CSV beside the sheet) makes re-runs incremental: a file already
 scored at the same mtime is skipped. Delete the ledger to force a full rescore.
@@ -356,7 +358,16 @@ def build_tables(ledger: pd.DataFrame, budget: int = BUDGET) -> dict:
         ).rename(columns={"actual": "MA-RAE"})
 
     # --- calibration: each pair's smallest |expected - actual| -------------
-    cal = ranked.dropna(subset=["cal_error"])
+    # Constant baselines are excluded. A flat prediction scores an MA-RAE of
+    # about 1.0 by construction, and the expected value comes out of the same
+    # arithmetic on the training set, so it calibrates near-perfectly without
+    # any modelling skill -- left in, it wins this tab and nobody can beat it.
+    # Excluded whether or not it was free: a paid second constant is just as
+    # trivial to predict. They stay on accuracy and the endpoint tabs.
+    cal = ranked
+    if "constant" in cal.columns:
+        cal = cal[cal["constant"] != True]  # noqa: E712  -- keeps NaN
+    cal = cal.dropna(subset=["cal_error"])
     if cal.empty:
         tables["calibration"] = pd.DataFrame(
             columns=["rank", "pair", "cal_error"])
