@@ -12,7 +12,14 @@ directly with `pd.read_csv(..., sep="\t")`.
 | `solubility_aqsoldb.tab` | `Solubility_AqSolDB` | 9,982 | log mol/L |
 | `ppbr_az.tab` | `PPBR_AZ` | 2,828 | percent bound |
 | `clearance_hepatocyte_az.tab` | `Clearance_Hepatocyte_AZ` | 1,213 | µL/min/10⁶ cells |
+| `clearance_microsome_az.tab` | `Clearance_Microsome_AZ` | 1,102 | µL/min/mg protein |
 | `lipophilicity_astrazeneca.tab` | `Lipophilicity_AstraZeneca` | 4,200 | logD at pH 7.4 |
+
+TDC's ADME page states units for **one** of these (`PPBR_AZ`, "the percentage
+of a drug bound to plasma proteins"). The rest of that column comes from the
+upstream papers, the ChEMBL assay records, or the value ranges. Do not treat
+it as authoritative — the notebook's third exercise depends on students
+discovering that the documentation is mostly silent.
 
 Two things about these files are load-bearing for the notebook's exercise, so
 do not "tidy" them:
