@@ -57,30 +57,27 @@ TEST_REPO = "openadmet/openadmet-expansionrx-challenge-test-data-blinded"
 TRAIN_REPO_FALLBACKS = ["openadmet/openadmet-challenge-train-data"]
 TEST_REPO_FALLBACKS = ["openadmet/openadmet-challenge-test-data-blinded"]
 
-# Pre-built artifacts (descriptors, CheMeleon embeddings, harmonized external
-# data). Normally these sit in an `artifacts/` subfolder of the shared,
-# read-only Drive folder that also holds the notebooks -- no web host needed.
-# ARTIFACT_BASE is an optional HTTP fallback. See instructor/SETUP.md.
-MATERIALS_DIR = os.environ.get(
-    "ADMET_MATERIALS_DIR", "/content/drive/MyDrive/AI4Chem_ADMET_Hackathon")
-ARTIFACT_BASE = os.environ.get("ADMET_ARTIFACT_BASE", "")
-
 # =========================================================================
 # SETUP 2 of 3 -- submission target.
 #
 # Either point LEADERBOARD_URL at a scoring endpoint, or leave it blank and
-# set SHARED_DIR to a Google Drive folder shared with all participants.
-# The instructor script instructor/score_leaderboard.py reads SHARED_DIR.
+# let every pair write into SHARED_DRIVE_NAME, a Google Drive *shared drive*
+# that all participants are members of (Contributor role is enough).
+# The instructor script Setup/score_leaderboard.py reads SHARED_DIR.
+#
+# In Colab a shared drive is mounted at
+#     /content/drive/Shareddrives/<name of the shared drive>
+# ADMET_SHARED_DIR overrides all of this with an explicit path.
 # =========================================================================
 
 LEADERBOARD_URL = os.environ.get("ADMET_LEADERBOARD_URL", "")
-SHARED_DIR = os.environ.get("ADMET_SHARED_DIR", "/content/drive/Shareddrives/AI4ChemicalSciences_OpenADMET_TeamFolders")
 
-# Layout inside SHARED_DIR: one folder per pair, holding that pair's
-# submissions. setup() creates it.
-#
-#   <SHARED_DIR>/<pair>/     <- every submission this pair writes
-#
+#: name of the shared drive (or of a folder inside one) holding team folders
+SHARED_DRIVE_NAME = "OpenADMET_TeamFolders"
+
+SHARED_DIR = os.environ.get(
+    "ADMET_SHARED_DIR", f"/content/drive/Shareddrives/{SHARED_DRIVE_NAME}"
+)
 
 # SETUP 3 of 3 -- how many leaderboard submissions each pair gets for the day.
 SUBMISSION_BUDGET = 10
@@ -121,7 +118,7 @@ ENDPOINT_FAMILIES = {
 # Workspace
 # =========================================================================
 
-_STATE = {"pair": None, "workdir": None, "submissions_dir": ""}
+_STATE = {"pair": None, "workdir": None, "split": None}
 
 
 def in_colab() -> bool:
@@ -129,14 +126,15 @@ def in_colab() -> bool:
 
 
 def setup(pair: str, mount_drive: bool = True, quiet: bool = False) -> str:
-    """Create (or reattach to) this pair's persistent workspace.
+    """Create (or reattach to) this pair's folder in the shared Drive.
 
-    Run this once at the top of every notebook. Everything you produce --
-    your split, your cached features, your predictions -- lands in this one
-    folder, which is how notebooks share results without needing to be run
-    in any particular order.
+    Run this once at the top of every notebook. ONE folder holds everything
+    you produce -- your split, your predictions, your submission files --
+    which is how notebooks share results without needing to be run in any
+    particular order. The repo you cloned is read-only and disappears when
+    the runtime does; this folder is what persists.
 
-    Returns the workspace path.
+    Returns the folder path.
     """
     pair = re.sub(r"[^A-Za-z0-9_-]+", "-", pair.strip().lower()).strip("-")
     if not pair:
@@ -147,65 +145,90 @@ def setup(pair: str, mount_drive: bool = True, quiet: bool = False) -> str:
             from google.colab import drive  # type: ignore
             if not os.path.isdir("/content/drive/MyDrive"):
                 drive.mount("/content/drive")
-            base = "/content/drive/MyDrive/admet_hackathon"
         except Exception as exc:  # pragma: no cover - Drive is best-effort
-            warnings.warn(
-                f"Could not mount Drive ({exc}). Falling back to local storage, "
-                "which is LOST when this runtime disconnects. Use "
-                "common.download_workspace() before you close the tab."
-            )
-            base = "/content/admet_hackathon"
-    else:
-        base = os.path.abspath(os.environ.get("ADMET_HOME", "./admet_hackathon"))
+            warnings.warn(f"Could not mount Drive ({exc}).")
 
+    base = _workspace_base()
     workdir = os.path.join(base, pair)
     os.makedirs(workdir, exist_ok=True)
     os.makedirs(os.path.join(workdir, "predictions"), exist_ok=True)
     _STATE["pair"] = pair
     _STATE["workdir"] = workdir
 
-    shared = _make_team_folder(pair)
-
     if not quiet:
-        print(f"pair      : {pair}")
-        print(f"workspace : {workdir}")
-        if shared:
-            print(f"submissions: {shared}")
-        n = len(list_predictions())
-        print(f"prediction files on hand: {n}")
+        print(f"pair   : {pair}")
+        print(f"folder : {workdir}")
+        n = len(submissions_prepared())
+        print(f"submission files on hand: {n}")
     return workdir
 
 
-def _make_team_folder(pair: str) -> str:
-    """Create this pair's folder in the shared Drive folder.
+def _shared_dir_candidates() -> list[str]:
+    """Every place SHARED_DRIVE_NAME could plausibly show up once Drive mounts.
 
-    Best-effort: on a laptop with no Drive mounted, or if the shared folder
-    is read-only, we warn and carry on. Nothing else in the notebook needs
-    it to exist until the pair actually submits.
-
-    Returns the folder path, or "" if it could not be created.
+    Colab mounts shared drives under /content/drive/Shareddrives/<drive name>.
+    We also look one level in (in case it is a folder inside a bigger shared
+    drive) and in MyDrive (in case someone made a shortcut instead).
     """
-    if not SHARED_DIR:
-        return ""
-    d = os.path.join(SHARED_DIR, pair)
-    try:
-        os.makedirs(d, exist_ok=True)
-    except OSError as exc:
-        warnings.warn(
-            f"Could not create your folder at {d} ({exc}). Submissions will "
-            "stay in your local workspace until the shared folder is "
-            "reachable -- check that Drive is mounted.")
-        return ""
-    _STATE["submissions_dir"] = d
-    return d
+    import glob
+
+    cands = []
+    env = os.environ.get("ADMET_SHARED_DIR", "").strip()
+    if env:
+        cands.append(env)
+    if SHARED_DIR:
+        cands.append(SHARED_DIR)
+    for root in ("/content/drive/Shareddrives", "/content/drive/Shared drives"):
+        cands.append(os.path.join(root, SHARED_DRIVE_NAME))
+        cands.extend(sorted(glob.glob(os.path.join(root, "*", SHARED_DRIVE_NAME))))
+    cands.append(os.path.join("/content/drive/MyDrive", SHARED_DRIVE_NAME))
+
+    out, seen = [], set()
+    for c in cands:
+        c = c.rstrip("/")
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def shared_dir() -> str | None:
+    """The shared drive folder holding every team folder, or None if unseen."""
+    for cand in _shared_dir_candidates():
+        if os.path.isdir(cand):
+            return cand
+    return None
+
+
+def _workspace_base() -> str:
+    """The shared Drive folder, or a local fallback if it is not reachable."""
+    found = shared_dir()
+    if found:
+        return found
+    local = os.path.abspath(os.environ.get("ADMET_HOME", "./admet_hackathon"))
+    listing = ""
+    root = "/content/drive/Shareddrives"
+    if os.path.isdir(root):
+        names = sorted(os.listdir(root))
+        listing = ("   Shared drives visible to you right now: "
+                   + (", ".join(names) if names else "(none)") + "\n")
+    print(f"!! shared drive '{SHARED_DRIVE_NAME}' is not visible.\n"
+          f"{listing}"
+          f"   Falling back to {local}, which is LOST when this runtime\n"
+          "   disconnects. Fix it in three steps, then re-run this cell:\n"
+          "     1. open drive.google.com and click 'Shared drives' in the left\n"
+          f"        sidebar -- you should see '{SHARED_DRIVE_NAME}' listed. If you\n"
+          "        do not, ask an instructor to add your Google account to it as\n"
+          "        a Contributor (a shared link is not enough).\n"
+          "     2. in Colab, click the folder icon in the left sidebar and\n"
+          "        'Mount Drive', and allow access when prompted.\n"
+          "     3. re-run this cell.")
+    return local
 
 
 def submissions_dir(create: bool = True) -> str:
-    """This pair's folder in the shared Drive folder: <SHARED_DIR>/<pair>."""
-    d = os.path.join(SHARED_DIR, pair_name())
-    if create:
-        os.makedirs(d, exist_ok=True)
-    return d
+    """Where submission files go -- the same folder as everything else."""
+    return workdir()
 
 
 def workdir() -> str:
@@ -273,7 +296,6 @@ def data_dirs() -> list[str]:
         dirs.append(override)
     dirs += [
         REPO_DATA_DIR,                            # <repo>/Data  (this layout)
-        os.path.join(MATERIALS_DIR, "data"),      # shared Drive folder
         os.path.join(os.getcwd(), "Data"),        # Data/ under the cwd
         os.getcwd(),                              # next to the notebook
     ]
@@ -336,34 +358,6 @@ def load_test(log_scale: bool = True) -> pd.DataFrame:
         _CACHE[("test", False)] = raw
         _CACHE[("test", True)] = to_log_scale(raw)
     return _CACHE[key].copy()
-
-
-def _read_table(src: str) -> pd.DataFrame:
-    return pd.read_parquet(src) if src.endswith(".parquet") else pd.read_csv(src)
-
-
-def load_artifact(name: str) -> pd.DataFrame:
-    """Load a pre-built artifact (descriptors, embeddings, external data).
-
-    Looks in this repo and the shared Drive folder first, then an optional
-    HTTP fallback. These are precomputed so that a dead Colab runtime never
-    costs you an hour.
-    """
-    looked = []
-    for d in data_dirs():
-        for candidate in (os.path.join(d, "artifacts", name),
-                          os.path.join(d, name)):
-            looked.append(candidate)
-            if os.path.exists(candidate):
-                return _read_table(candidate)
-    if ARTIFACT_BASE:
-        return _read_table(ARTIFACT_BASE.rstrip("/") + "/" + name)
-    raise RuntimeError(
-        f"Artifact '{name}' not found.\n"
-        "Looked in:\n  " + "\n  ".join(looked) + "\n"
-        "Ask an instructor, or compute it yourself with the (slower) code in "
-        "the notebook."
-    )
 
 
 # =========================================================================
@@ -497,83 +491,15 @@ def ma_rae(y_true_df: pd.DataFrame, y_pred_df: pd.DataFrame) -> float:
 # Splits
 # =========================================================================
 
-def _registration_number(names: pd.Series) -> pd.Series:
-    """Compound IDs look like 'E-0001321'. The number increases over time as
-    compounds are registered, so it is a usable proxy for synthesis date --
-    which is what lets us build a temporal split without a date column.
-    """
-    return names.astype(str).str.extract(r"(\d+)", expand=False).astype(float)
-
-
-def temporal_split(df: pd.DataFrame, frac_val: float = 0.2) -> pd.Series:
-    order = _registration_number(df[ID_COL]).rank(method="first", na_option="bottom")
-    cutoff = order.quantile(1.0 - frac_val)
-    return pd.Series(np.where(order > cutoff, "val", "train"), index=df.index)
-
-
 def random_split(df: pd.DataFrame, frac_val: float = 0.2, seed: int = 0) -> pd.Series:
     rng = np.random.default_rng(seed)
     pick = rng.random(len(df)) < frac_val
     return pd.Series(np.where(pick, "val", "train"), index=df.index)
 
-
-def scaffold_split(df: pd.DataFrame, frac_val: float = 0.2, seed: int = 0) -> pd.Series:
-    """Bemis-Murcko scaffold split: whole scaffold groups go to one side, so
-    the validation set contains chemical series the model has never seen.
-    """
-    from rdkit import Chem, RDLogger
-    from rdkit.Chem.Scaffolds import MurckoScaffold
-    RDLogger.DisableLog("rdApp.*")
-
-    scaffolds: dict[str, list[int]] = {}
-    for i, smi in enumerate(df[SMILES_COL]):
-        try:
-            s = MurckoScaffold.MurckoScaffoldSmiles(
-                mol=Chem.MolFromSmiles(smi), includeChirality=False)
-        except Exception:
-            s = ""
-        scaffolds.setdefault(s or f"__unparsed_{i}", []).append(i)
-
-    groups = sorted(scaffolds.values(), key=len, reverse=True)
-    rng = np.random.default_rng(seed)
-    rng.shuffle(groups)  # break ties between equally sized scaffolds
-    groups = sorted(groups, key=len, reverse=True)
-
-    target = int(round(frac_val * len(df)))
-    labels = np.array(["train"] * len(df), dtype=object)
-    n_val = 0
-    for g in groups:
-        if n_val + len(g) <= target:
-            labels[g] = "val"
-            n_val += len(g)
-    return pd.Series(labels, index=df.index)
-
-
-def similarity_split(df: pd.DataFrame, frac_val: float = 0.2,
-                     radius: int = 2, n_bits: int = 2048) -> pd.Series:
-    """Hold out the molecules that are LEAST similar to everything else.
-
-    A deliberately pessimistic split: it asks how the model behaves on the
-    edge of its own chemical space, which is the situation you are actually
-    in when you score a newly designed compound.
-    """
-    fps = morgan_fingerprints(df[SMILES_COL], radius=radius, n_bits=n_bits)
-    sim = nearest_neighbour_similarity(fps, fps, exclude_self=True)
-    cutoff = np.nanquantile(sim, frac_val)
-    return pd.Series(np.where(sim <= cutoff, "val", "train"), index=df.index)
-
-
 SPLITTERS = {
-    "temporal": temporal_split,
-    "random": random_split,
-    "scaffold": scaffold_split,
-    "similarity": similarity_split,
+    "random": random_split
 }
 
-# Which splitter load_split() falls back to when no split has been saved.
-# Override per-call with load_split(default="random"), for the whole session
-# with common.DEFAULT_SPLIT = "random", or via the ADMET_DEFAULT_SPLIT env var.
-DEFAULT_SPLIT = os.environ.get("ADMET_DEFAULT_SPLIT", "temporal")
 DEFAULT_SPLIT_SEED = int(os.environ.get("ADMET_DEFAULT_SPLIT_SEED", "0"))
 DEFAULT_FRAC_VAL = 0.2
 
@@ -594,9 +520,61 @@ def make_split(df: pd.DataFrame, method: str, frac_val: float = DEFAULT_FRAC_VAL
     return fn(df, **kwargs)
 
 
+def check_split(fold, df: pd.DataFrame) -> pd.Series:
+    """Validate a split before you spend five minutes training on it.
+
+    Catches the three things that actually go wrong: wrong length, an index
+    that does not line up with df, and labels that are not "train"/"val".
+    Returns the split as a Series so you can chain it.
+
+    "unused" is a legal third label, for splits that hold some molecules out
+    of both sides -- rolling-origin cross-validation, where a fold must not
+    train on compounds registered after its validation block.
+    """
+    fold = pd.Series(fold) if not isinstance(fold, pd.Series) else fold
+    if len(fold) != len(df):
+        raise ValueError(
+            f"split has {len(fold)} labels but df has {len(df)} rows")
+    if not fold.index.equals(df.index):
+        raise ValueError(
+            "split index does not match df -- return a Series with "
+            "index=df.index (a fresh index from .reset_index() will not align)")
+    bad = sorted(set(fold.dropna().unique()) - {"train", "val", "unused"})
+    if bad:
+        raise ValueError(
+            f'labels must be "train", "val" or "unused"; found {bad}')
+    if fold.isna().any():
+        raise ValueError(f"{int(fold.isna().sum())} rows have no label")
+    n_train = int((fold == "train").sum())
+    n_val = int((fold == "val").sum())
+    if n_train == 0 or n_val == 0:
+        raise ValueError(
+            f"a split needs both sides; got {n_train} train / {n_val} val")
+    return fold
+
+
+def splits_dir(create: bool = True) -> str:
+    """Your library of saved splits: <folder>/splits."""
+    d = os.path.join(workdir(), "splits")
+    if create:
+        os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _split_slug(name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", str(name).strip().lower()).strip("-")
+    if not slug:
+        raise ValueError("Give the split a name, e.g. name='top-logD-decile'")
+    return slug
+
+
 def save_split(split: pd.Series, df: pd.DataFrame, method: str,
-               rationale: str = "", val_score: float | None = None) -> str:
-    """Freeze a train/val assignment so every other notebook can reuse it.
+               name: str = "") -> str:
+    """Add a split to your library under a name you choose.
+
+    Saving does not make it "the" split -- there is no current split. Every
+    time you train, you pick one by name with load_split(name=...). Save as
+    many as you like and compare them.
 
     We save the ASSIGNMENT (molecule -> fold), not the recipe. That way a
     split you invented yourself ports just as well as a built-in one.
@@ -607,88 +585,118 @@ def save_split(split: pd.Series, df: pd.DataFrame, method: str,
     per endpoint -- silently validates single-task and multitask models on
     different molecules and makes their scores incomparable.
     """
+    split = check_split(split, df)
+    slug = _split_slug(name or method)
     out = pd.DataFrame({ID_COL: df[ID_COL].to_numpy(), "fold": np.asarray(split)})
-    path = os.path.join(workdir(), "split.csv")
+    path = os.path.join(splits_dir(), slug + ".csv")
     out.to_csv(path, index=False)
-    meta = {"method": method, "rationale": rationale, "val_score": val_score,
+    meta = {"name": slug, "method": method,
             "n_train": int((out["fold"] == "train").sum()),
             "n_val": int((out["fold"] == "val").sum()),
             "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-    with open(os.path.join(workdir(), "split_meta.json"), "w") as fh:
+    with open(path.replace(".csv", ".json"), "w") as fh:
         json.dump(meta, fh, indent=2)
-    print(f"saved split '{method}': {meta['n_train']} train / {meta['n_val']} val")
+    print(f"saved split '{slug}': {meta['n_train']} train / {meta['n_val']} val")
     return path
 
 
+def list_splits() -> pd.DataFrame:
+    """Every split you have saved today, newest last."""
+    cols = ["name", "method", "n_train", "n_val", "saved_at"]
+    d = os.path.join(_STATE["workdir"] or ".", "splits")
+    if not os.path.isdir(d):
+        return pd.DataFrame(columns=cols)
+    rows = []
+    for f in sorted(os.listdir(d)):
+        if not f.endswith(".csv"):
+            continue
+        meta = {"name": f[:-4]}
+        try:
+            with open(os.path.join(d, f.replace(".csv", ".json"))) as fh:
+                meta.update(json.load(fh))
+        except Exception:
+            pass
+        rows.append({c: meta.get(c) for c in cols})
+    return pd.DataFrame(rows, columns=cols).sort_values("saved_at").reset_index(drop=True)
+
+
+def saved_split_names() -> list[str]:
+    return list_splits()["name"].tolist()
+
+
 def split_metadata() -> dict:
-    """Just the metadata for this pair's split -- no data download needed."""
-    try:
-        with open(os.path.join(workdir(), "split_meta.json")) as fh:
-            return json.load(fh)
-    except Exception:
-        return {"method": f"{DEFAULT_SPLIT} (default)", "rationale": "",
-                "val_score": None}
+    """Metadata for the split you most recently loaded this session."""
+    return dict(_STATE["split"] or {})
 
 
-def load_split(df: pd.DataFrame | None = None, verbose: bool = True,
-               default: str | None = None,
+def load_split(df: pd.DataFrame | None = None, name: str | None = None,
+               verbose: bool = True,
                frac_val: float = DEFAULT_FRAC_VAL,
-               seed: int | None = None,
-               name: str | None = None):
-    """Load this pair's saved split, or fall back to a freshly computed one.
+               seed: int | None = None):
+    """Pick the split to train against, by name. There is no default.
 
-    `default` (alias: `name`) picks the fallback splitter -- "random",
-    "temporal", "scaffold" or "similarity". It only applies when no split has
-    been saved; a saved split always wins. Leave it None for common.DEFAULT_SPLIT.
+    `name` is either one of your saved splits (see list_splits()) or one of
+    the few built-in recipes in SPLITTERS, computed on the spot. Saved splits
+    win if the names collide. There is deliberately no default: which split
+    you validate against is the decision this notebook is about.
 
-    Never raises just because you skipped 02_validation.
     Returns (fold_series_aligned_to_df, metadata_dict).
     """
-    if default is None:
-        default = name                     # notebooks call load_split(name=...)
-    method = DEFAULT_SPLIT if default is None else default
-    if method not in SPLITTERS:                    # fail before the data load
+    if name is None:
         raise ValueError(
-            f"Unknown split method {method!r}. "
-            f"Pick one of: {', '.join(sorted(SPLITTERS))}")
-    seed = DEFAULT_SPLIT_SEED if seed is None else seed
+            "Say which split to use, e.g. load_split(train, name='random').\n"
+            f"  saved     : {', '.join(saved_split_names()) or '(none yet)'}\n"
+            f"  built-ins : {', '.join(sorted(SPLITTERS))}")
+
+    slug = _split_slug(name)
+    path = os.path.join(splits_dir(create=False), slug + ".csv")
+    if not os.path.exists(path) and name not in SPLITTERS:
+        raise ValueError(
+            f"No split called {name!r}.\n"
+            f"  saved     : {', '.join(saved_split_names()) or '(none yet)'}\n"
+            f"  built-ins : {', '.join(sorted(SPLITTERS))}")
 
     df = load_train() if df is None else df
-    path = os.path.join(workdir(), "split.csv")
+
     if os.path.exists(path):
         saved = pd.read_csv(path).drop_duplicates(ID_COL).set_index(ID_COL)["fold"]
-        fold = df[ID_COL].map(saved).fillna("train")
+        fold = df[ID_COL].map(saved)
+        missing = int(fold.isna().sum())
+        if missing:
+            warnings.warn(f"{missing} molecules are not in saved split "
+                          f"'{slug}'; treating them as train.")
+            fold = fold.fillna("train")
+        meta = {"name": slug, "method": slug}
         try:
-            with open(os.path.join(workdir(), "split_meta.json")) as fh:
-                meta = json.load(fh)
+            with open(path.replace(".csv", ".json")) as fh:
+                meta.update(json.load(fh))
         except Exception:
-            meta = {"method": "saved"}
+            pass
         if verbose:
-            print(f"using YOUR split: {meta.get('method')} "
+            print(f"using your saved split '{slug}' "
                   f"({(fold == 'val').sum()} val molecules)")
-        return fold.reset_index(drop=True), meta
-    fold = make_split(df, method, frac_val=frac_val, seed=seed)
-    if verbose:
-        print(f"no saved split found -- using the default {method} split "
-              f"({(fold == 'val').sum()} val molecules). "
-              "Run 02_validation.ipynb to choose your own.")
-    meta = {"method": f"{method} (default)", "rationale": "", "val_score": None,
-            "frac_val": frac_val}
-    if "seed" in inspect.signature(SPLITTERS[method]).parameters:
-        meta["seed"] = seed
+    else:
+        seed = DEFAULT_SPLIT_SEED if seed is None else seed
+        fold = make_split(df, name, frac_val=frac_val, seed=seed)
+        meta = {"name": name, "method": name, "frac_val": frac_val}
+        if "seed" in inspect.signature(SPLITTERS[name]).parameters:
+            meta["seed"] = seed
+        if verbose:
+            print(f"using the built-in {name} split "
+                  f"({(fold == 'val').sum()} val molecules) -- "
+                  "save_split() it if you want to keep it.")
+
+    _STATE["split"] = meta
     return fold.reset_index(drop=True), meta
 
 
 # =========================================================================
 # Predictions
+#
+# There is one way to save a prediction vector: prepare_submission(). It writes
+# a single self-describing file, and read_submission() reads it back, which is
+# how a later notebook picks up work from an earlier one.
 # =========================================================================
-
-def blank_predictions(df: pd.DataFrame) -> pd.DataFrame:
-    out = pd.DataFrame({ID_COL: df[ID_COL].to_numpy()})
-    for e in ENDPOINTS:
-        out[e] = np.nan
-    return out
-
 
 def check_predictions(pred: pd.DataFrame, against: pd.DataFrame | None = None) -> pd.DataFrame:
     """Validate shape before you burn a submission on a malformed file."""
@@ -710,62 +718,177 @@ def check_predictions(pred: pd.DataFrame, against: pd.DataFrame | None = None) -
     return pred[[ID_COL] + ENDPOINTS]
 
 
-def save_predictions(pred: pd.DataFrame, name: str, note: str = "") -> str:
-    """Save predictions into your workspace under a name you choose.
+# =========================================================================
+# Scores -- one row per (model, split), accumulated across the whole day
+# =========================================================================
 
-    Every notebook writes this same format, which is the only reason the
-    ensemble card can pick up work from notebooks you ran hours earlier.
+#: how many splits to score a single model against. More than this and the
+#: table stops being something you can read and reason about at 4pm.
+EVAL_SPLIT_CAP = 4
+
+SCORE_COLS = ["model", "split", "ma_rae", "note", "logged_at"]
+
+
+def known_split_names() -> list[str]:
+    """Everything load_split() will accept: your library plus the built-ins."""
+    return saved_split_names() + [s for s in SPLITTERS
+                                  if s not in saved_split_names()]
+
+
+def scored_split_names() -> list[str]:
+    """Anything you have logged a score against, including CV scheme names."""
+    scores = list_scores()
+    if scores.empty:
+        return []
+    return sorted(scores["split"].dropna().astype(str).unique().tolist())
+
+
+def check_submission_split(split: str) -> str:
+    """Validate the ONE split a submission is betting on.
+
+    Looser than check_eval_splits on purpose: a submission may cite a CV
+    scheme ("cv-cluster") that is not itself a loadable split, as long as you
+    logged a score against it. It only has to be a thing you can point at.
     """
-    pred = check_predictions(pred)
-    meta = split_metadata()
-    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", name.strip().lower()).strip("-")
-    path = os.path.join(workdir(), "predictions", f"{slug}.csv")
-    pred.to_csv(path, index=False)
-    with open(path.replace(".csv", ".json"), "w") as fh:
-        json.dump({"name": slug, "note": note, "split": meta.get("method"),
-                   "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds")},
-                  fh, indent=2)
-    print(f"saved '{slug}' ({len(pred)} molecules)")
+    split = str(split).strip()
+    if not split:
+        raise ValueError(
+            "Name the split your estimate came from -- that is the hypothesis "
+            "you are betting on.")
+    known = known_split_names() + scored_split_names()
+    if split not in known:
+        raise ValueError(
+            f"Nothing called {split!r} in your splits or your score table.\n"
+            f"  splits : {', '.join(known_split_names()) or '(none yet)'}\n"
+            f"  scored : {', '.join(scored_split_names()) or '(none yet)'}")
+    return split
+
+
+def check_eval_splits(names) -> list[str]:
+    """Validate the handful of splits you are scoring a model against.
+
+    Deliberately capped: comparing one model on four splits tells you
+    something, on twelve it tells you nothing you will actually read.
+
+    These names have to be loadable, since you are about to train against
+    them. A submission is checked more loosely -- see check_submission_split.
+    """
+    names = list(dict.fromkeys(names))
+    if not names:
+        raise ValueError("Pick at least one split to score against.")
+    if len(names) > EVAL_SPLIT_CAP:
+        raise ValueError(
+            f"{len(names)} splits is too many -- pick at most {EVAL_SPLIT_CAP}. "
+            "Keep the one you trust most and drop the rest; you can always "
+            "come back and score against another.")
+    known = known_split_names()
+    unknown = [n for n in names if _split_slug(n) not in known and n not in SPLITTERS]
+    if unknown:
+        raise ValueError(
+            f"No split called {unknown}. You have: "
+            f"{', '.join(known) or '(none yet)'}")
+    return names
+
+
+def log_score(model: str, split: str, ma_rae: float, note: str = "") -> str:
+    """Record what one model scored on one split.
+
+    Re-logging the same (model, split) overwrites the old row, so re-running a
+    cell does not litter the table.
+    """
+    scores = list_scores()
+    keep = scores[~((scores["model"] == model) & (scores["split"] == split))]
+    row = {"model": model, "split": split, "ma_rae": float(ma_rae),
+           "note": note,
+           "logged_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    out = pd.concat([keep, pd.DataFrame([row])], ignore_index=True)
+    path = os.path.join(workdir(), "scores.csv")
+    out.to_csv(path, index=False)
+    print(f"logged {model} on '{split}': MA-RAE = {ma_rae:.3f}")
     return path
 
 
-def list_predictions() -> pd.DataFrame:
-    d = os.path.join(_STATE["workdir"] or ".", "predictions")
-    if not os.path.isdir(d):
-        return pd.DataFrame(columns=["name", "note", "split", "saved_at"])
-    rows = []
-    for f in sorted(os.listdir(d)):
-        if not f.endswith(".csv"):
-            continue
-        meta = {"name": f[:-4], "note": "", "split": "?", "saved_at": ""}
-        try:
-            with open(os.path.join(d, f.replace(".csv", ".json"))) as fh:
-                meta.update(json.load(fh))
-        except Exception:
-            pass
-        rows.append(meta)
-    return pd.DataFrame(rows)
+def score(y_true_df: pd.DataFrame, y_pred_df: pd.DataFrame,
+          model: str | None = None, split: str | None = None,
+          endpoints: list[str] | None = None, note: str = "") -> pd.DataFrame:
+    """Per-endpoint MAE / RAE / R2 / Spearman / Kendall -- and log the MA-RAE.
+
+    Name the model and the split and it records one row in your score table,
+    which is what builds up common.score_matrix() over the day:
+
+        metrics = common.score(truth, preds, "lgbm-rdkit", SPLIT)
+
+    Leave them out and it just computes, for a one-off look at numbers you do
+    not want in the table:
+
+        common.score(train_truth, train_preds)
+    """
+    if isinstance(model, (list, tuple, set)):
+        raise TypeError(
+            "score()'s third argument is the MODEL NAME, not the endpoints. "
+            f"You passed {model!r}.\n"
+            "  to score a subset : common.score(truth, preds, endpoints=[...])\n"
+            "  to log a result   : common.score(truth, preds, \"my-model\", SPLIT)")
+
+    metrics = evaluate(y_true_df, y_pred_df, endpoints)
+    if model and split:
+        scored = list(endpoints) if endpoints else ENDPOINTS
+        if len(scored) < len(ENDPOINTS):
+            # MA-RAE is the average over ALL nine endpoints. A model scored on
+            # fewer has an average over a different, easier or harder set --
+            # the two numbers are not comparable, and the leaderboard cannot
+            # rank a partial model against a complete one.
+            note = (note + f" [partial: {len(scored)}/{len(ENDPOINTS)} endpoints]").strip()
+            warnings.warn(
+                f"{model!r} was scored on {len(scored)} of {len(ENDPOINTS)} "
+                "endpoints. Its MA-RAE averages over those only, so it is not "
+                "comparable with a full model and will NOT count toward the "
+                "MA-RAE leaderboard. Useful for the per-endpoint boards, and "
+                "for comparing against another partial model on the same "
+                "endpoints.")
+        log_score(model, split, metrics["RAE"].mean(), note=note)
+    return metrics
 
 
-def load_predictions(name: str) -> pd.DataFrame:
-    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", name.strip().lower()).strip("-")
-    path = os.path.join(workdir(), "predictions", f"{slug}.csv")
+def list_scores() -> pd.DataFrame:
+    """Every (model, split) score you have logged today."""
+    path = os.path.join(_STATE["workdir"] or ".", "scores.csv")
     if not os.path.exists(path):
-        have = ", ".join(list_predictions()["name"].tolist()) or "(none yet)"
-        raise FileNotFoundError(f"No predictions named '{slug}'. You have: {have}")
+        return pd.DataFrame(columns=SCORE_COLS)
     return pd.read_csv(path)
+
+
+def score_matrix() -> pd.DataFrame:
+    """Models down the side, splits across the top. The 4pm view."""
+    s = list_scores()
+    if s.empty:
+        return pd.DataFrame()
+    return s.pivot_table(index="model", columns="split", values="ma_rae")
 
 
 # =========================================================================
 # Submission
 # =========================================================================
 
-def submissions_used() -> int:
-    log = os.path.join(_STATE["workdir"] or ".", "submissions.jsonl")
-    if not os.path.exists(log):
-        return 0
-    with open(log) as fh:
-        return sum(1 for line in fh if line.strip())
+def submissions_prepared() -> pd.DataFrame:
+    """Every submission file you have written, newest last.
+
+    Preparing is free -- this is not a count of what you have spent. What you
+    spend is what you drag into the Scored folder.
+    """
+    cols = ["model", "file", "prepared_at", "expected_ma_rae", "split", "why"]
+    d = _STATE["workdir"] or "."
+    rows = []
+    for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        if not (f.startswith(f"{_STATE['pair']}__") and f.endswith(".csv")):
+            continue
+        path = os.path.join(d, f)
+        _, meta = read_submission(path)
+        meta["file"] = f
+        row = {c: meta.get(c) for c in cols}
+        row["path"] = path          # read_submission(path) to get the numbers back
+        rows.append(row)
+    return pd.DataFrame(rows, columns=cols + ["path"])
 
 
 #: metadata lines at the top of a submission start with this.
@@ -809,60 +932,77 @@ def read_submission(path: str) -> tuple[pd.DataFrame, dict]:
     return pd.read_csv(path, comment=META_PREFIX), record
 
 
-def prepare_submission(pred: pd.DataFrame, expected_ma_rae: float, why: str) -> str:
+def prepare_submission(pred: pd.DataFrame, model: str, split: str,
+                       why: str | None = None) -> str:
     """Write one submission file into your folder in the shared Drive.
 
-    Returns the path. Writing the file is all this does -- to have it scored,
-    drag it into the Scored folder (see 00_start_here).
+    Returns the path. Writing the file is ALL this does, and it is free --
+    prepare as many as you like. A submission only counts once you drag the
+    file into the Scored folder, and you get SUBMISSION_BUDGET of those for
+    the whole day. With a budget that small you cannot use the leaderboard as
+    a validation set, so your internal validation has to be honest.
 
-    You get SUBMISSION_BUDGET submissions for the whole day. That is
-    deliberate: with a budget this small you cannot use the leaderboard as a
-    validation set, so your internal validation has to be honest.
+    model : the name you logged this model under with score_and_log.
+    split : which split you are betting on. You may have scored this model
+            against four; a submission commits to one. There is no default --
+            naming it is the point, it is the hypothesis you are betting on.
+    why   : optional one line on what is different about this model. Defaults
+            to the note you attached when you logged the score, and may be
+            left empty.
 
-    expected_ma_rae : what you think you will score, BEFORE you find out.
-                      This feeds the calibration leaderboard, which ranks
-                      pairs on how close that guess was -- not on the score.
-    why             : one sentence on what changed since your last submission.
+    The predicted MA-RAE is not an argument: it is read from your score table,
+    so you cannot submit a number you never measured.
     """
-    used = submissions_used()
-    if used >= SUBMISSION_BUDGET:
-        raise RuntimeError(
-            f"You have used all {SUBMISSION_BUDGET} submissions. Your best "
-            "already-submitted entry still counts -- go write your report.")
-    if not why.strip():
-        raise ValueError("Say what changed. Future-you writing slide 2 will thank you.")
-    if not np.isfinite(expected_ma_rae):
-        raise ValueError("Commit to a number for expected_ma_rae before submitting.")
+    split = check_submission_split(split)
+    pred = check_predictions(pred, against=load_test())
 
-    test = load_test()
-    pred = check_predictions(pred, against=test)
-    meta = split_metadata()
+    scores = list_scores()
+    row = scores[(scores["model"] == model) & (scores["split"] == split)]
+    if row.empty:
+        mine = scores[scores["model"] == model]
+        if mine.empty:
+            raise ValueError(
+                f"No score logged for {model!r}. Run score_and_log() first -- "
+                "the number you submit has to be one you measured.\n"
+                f"You have logged: {', '.join(sorted(scores['model'].unique())) or '(nothing yet)'}")
+        have = "\n".join(f"  {r.split:<14s} {r.ma_rae:.3f}"
+                          for r in mine.itertuples())
+        raise ValueError(
+            f"{model!r} has no score on {split!r}. It does have:\n{have}")
+
+    expected_ma_rae = float(row["ma_rae"].iloc[0])
+    if why is None:
+        note = row["note"].iloc[0]
+        why = "" if pd.isna(note) else str(note)   # an empty note reads back as NaN
+
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    record = {"pair": pair_name(), "submitted_at": stamp,
-              "expected_ma_rae": float(expected_ma_rae), "why": why.strip(),
-              "split": meta.get("method"), "n": int(len(pred)),
-              "attempt": used + 1}
+    record = {"pair": pair_name(), "model": model,
+              "prepared_at": stamp,
+              "expected_ma_rae": expected_ma_rae, "why": str(why).strip(),
+              "split": split, "n": int(len(pred))}
 
-    stem = f"{pair_name()}__{stamp}__attempt{used + 1}"
+    stem = f"{pair_name()}__{stamp}"
     path = os.path.join(submissions_dir(), stem + ".csv")
+    n = 2                       # two prepares in the same second must not collide
+    while os.path.exists(path):
+        path = os.path.join(submissions_dir(), f"{stem}-{n}.csv")
+        n += 1
     write_submission(path, pred, record)
     print(f"wrote your submission file:\n  {path}")
-
-    with open(os.path.join(workdir(), "submissions.jsonl"), "a") as fh:
-        fh.write(json.dumps(record) + "\n")
-    left = SUBMISSION_BUDGET - (used + 1)
-    print(f"submission {used + 1} of {SUBMISSION_BUDGET}. {left} left.")
-    print(f"you predicted MA-RAE = {expected_ma_rae:.3f}. Write that on slide 3.")
+    print(f"you predicted MA-RAE = {expected_ma_rae:.3f} (from '{split}').")
+    print(f"Nothing has been submitted yet -- drag this file into the Scored "
+          f"folder to spend one of your {SUBMISSION_BUDGET} submissions.")
     return path
 
 
-def submit(pred: pd.DataFrame, expected_ma_rae: float, why: str) -> str:
+def submit(pred: pd.DataFrame, model: str, split: str,
+           why: str | None = None) -> str:
     """prepare_submission(), plus a POST if a leaderboard endpoint is configured.
 
     With no LEADERBOARD_URL set -- the drag-it-across workflow -- this is
     exactly prepare_submission().
     """
-    path = prepare_submission(pred, expected_ma_rae, why)
+    path = prepare_submission(pred, model, split, why)
     if LEADERBOARD_URL:
         try:
             import requests
@@ -895,19 +1035,6 @@ def download_submission(path: str) -> None:
 # Chemistry helpers
 # =========================================================================
 
-def morgan_fingerprints(smiles, radius: int = 2, n_bits: int = 2048):
-    """Morgan (ECFP-like) bit fingerprints as a list of RDKit bit vectors."""
-    from rdkit import Chem, RDLogger
-    from rdkit.Chem import rdFingerprintGenerator
-    RDLogger.DisableLog("rdApp.*")
-    gen = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=n_bits)
-    out = []
-    for smi in smiles:
-        mol = Chem.MolFromSmiles(smi) if isinstance(smi, str) else None
-        out.append(gen.GetFingerprint(mol) if mol is not None else None)
-    return out
-
-
 def fingerprints_to_array(fps) -> np.ndarray:
     from rdkit import DataStructs
     n_bits = len(next(f for f in fps if f is not None))
@@ -922,11 +1049,6 @@ def nearest_neighbour_similarity(query_fps, reference_fps,
                                  exclude_self: bool = False) -> np.ndarray:
     """For each query molecule, the Tanimoto similarity to its closest
     neighbour in the reference set.
-
-    This is the number that tells you whether a prediction is interpolation
-    or extrapolation. For 2048-bit Morgan-2 fingerprints, similarities below
-    about 0.27 are indistinguishable from comparing two random molecules --
-    below that threshold, "nearest neighbour" carries no information.
     """
     from rdkit import DataStructs
     ref = [f for f in reference_fps if f is not None]
@@ -974,10 +1096,10 @@ def clean_features(X_train: pd.DataFrame, *others: pd.DataFrame):
     a quiet way to leak information and flatter your score.
     """
     keep = X_train.columns[(X_train.notna().any()) & (X_train.nunique(dropna=True) > 1)]
-    med = X_train[keep].median()
-    out = [X_train[keep].fillna(med)]
+    medians = X_train[keep].median()
+    out = [X_train[keep].fillna(medians)]
     for o in others:
-        out.append(o.reindex(columns=keep).fillna(med))
+        out.append(o.reindex(columns=keep).fillna(medians))
     return out[0] if not others else tuple(out)
 
 
@@ -992,7 +1114,7 @@ def predict_mean_baseline(train: pd.DataFrame, target: pd.DataFrame) -> pd.DataF
     Whatever it scores is the bar. Anything you build should beat it; if it
     does not, something is broken, and knowing that early is cheap.
     """
-    pred = blank_predictions(target)
-    for e in ENDPOINTS:
-        pred[e] = float(train[e].mean(skipna=True))
+    pred = pd.DataFrame({ID_COL: target[ID_COL].to_numpy()})
+    for endpoint in ENDPOINTS:
+        pred[endpoint] = float(train[endpoint].mean(skipna=True))
     return pred
