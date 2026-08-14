@@ -20,6 +20,15 @@ Rules, all deliberate:
     silently excluded from the metric, letting a team be scored on the subset
     they felt confident about.
   * a rejected file does not consume a budget slot -- it was never scored.
+  * nor does a DUPLICATE: predictions a pair already submitted, with the same
+    expected score, are recorded once. Re-dragging a file, or renaming a model
+    and resubmitting it, is free. A different expected score over the same
+    predictions is a new submission -- it is a different bet.
+  * nor does a pair's FIRST CONSTANT baseline, where every endpoint predicts
+    one value for every molecule. The train mean is a reference point, not a
+    model, so it is free -- but it IS ranked. Only the first: a ranked freebie
+    is a run at the calibration board, and one is a reference point where
+    unlimited would be a strategy.
   * of a pair's accepted files, the FIRST TEN by prepared_at are eligible.
     Later ones are recorded and shown, but not ranked.
   * accuracy ranks a pair by their single best MA-RAE.
@@ -34,8 +43,12 @@ scored at the same mtime is skipped. Delete the ledger to force a full rescore.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
+import time
+import traceback
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -46,9 +59,15 @@ import common  # noqa: E402
 
 BUDGET = 10
 
+#: predictions are compared for equality at this many decimal places. Six is
+#: far below the noise floor of every assay here, so two files that agree to
+#: six places are the same model, not two attempts.
+PRED_PRECISION = 6
+
 #: one row per submission file we have looked at
 LEDGER_COLS = ["file", "mtime", "pair", "model", "split", "prepared_at",
-               "expected", "actual", "cal_error", "status"] \
+               "expected", "actual", "cal_error", "pred_hash", "constant",
+               "status"] \
     + [f"RAE {e}" for e in common.ENDPOINTS] \
     + [f"MAE {e}" for e in common.ENDPOINTS]
 
@@ -113,6 +132,39 @@ def validate(preds: pd.DataFrame, truth: pd.DataFrame) -> str | None:
     return None
 
 
+def pred_hash(preds: pd.DataFrame) -> str:
+    """A fingerprint of the predicted numbers, ignoring row order and header.
+
+    Two files with the same fingerprint are the same set of predictions, so a
+    team that re-drags a file, or submits a model they already submitted under
+    a new name, is not spending a second budget slot on it.
+    """
+    canon = (preds[[common.ID_COL] + common.ENDPOINTS]
+             .sort_values(common.ID_COL)
+             .reset_index(drop=True))
+    for e in common.ENDPOINTS:
+        canon[e] = pd.to_numeric(canon[e], errors="coerce").round(PRED_PRECISION)
+    return hashlib.md5(canon.to_csv(index=False).encode()).hexdigest()[:16]
+
+
+def is_constant(preds: pd.DataFrame) -> bool:
+    """True if every endpoint predicts one value for every molecule.
+
+    That is the train-mean baseline, or any other constant. It is a useful
+    reference point and students should feel free to submit it, but it is not a
+    model, so it does not spend a budget slot.
+
+    All nine endpoints have to be flat. A file that models one endpoint and
+    falls back to the mean for the rest is still a real attempt at that one.
+    With 2282 molecules a genuine model will not hit this by accident.
+    """
+    for e in common.ENDPOINTS:
+        v = pd.to_numeric(preds[e], errors="coerce").round(PRED_PRECISION)
+        if v.nunique(dropna=True) > 1:
+            return False
+    return True
+
+
 def score_one(preds: pd.DataFrame, truth: pd.DataFrame) -> dict:
     """Per-endpoint RAE and MAE, plus the MA-RAE the leaderboard ranks on."""
     metrics = common.evaluate(truth, preds)
@@ -168,6 +220,8 @@ def score_folder(folder: str, truth: pd.DataFrame,
             row["status"] = f"rejected: {error}"
         else:
             row.update(score_one(preds, truth))
+            row["pred_hash"] = pred_hash(preds)
+            row["constant"] = is_constant(preds)
             row["status"] = "scored"
             if not np.isnan(row["expected"]):
                 row["cal_error"] = abs(row["expected"] - row["actual"])
@@ -191,20 +245,81 @@ def score_folder(folder: str, truth: pd.DataFrame,
 
 # ------------------------------------------------------------------- tables
 
+def mark_duplicates(ledger: pd.DataFrame) -> pd.DataFrame:
+    """Flag a pair's repeat submissions of predictions they already sent.
+
+    Keyed on (pair, predictions, expected score), so re-sending the same
+    numbers with the same bet is a no-op. Changing the expected score IS a new
+    submission even with identical predictions -- it is a different bet, and
+    the calibration board ranks the bet rather than the model.
+
+    Rows from a ledger written before hashing existed have no fingerprint and
+    are left alone; delete the ledger to rescore them if you care.
+    """
+    out = ledger.copy()
+    if "pred_hash" not in out.columns:
+        return out
+    scored = (out["status"] == "scored") & out["pred_hash"].notna()
+    if not scored.any():
+        return out
+
+    # dropna=False so two files that both logged no expected score still group
+    order = out[scored].sort_values(["prepared_at", "file"])
+    first = order.groupby(["pair", "pred_hash", "expected"],
+                         dropna=False)["file"].transform("first")
+    for idx in order.index[order["file"] != first]:
+        out.loc[idx, "status"] = f"duplicate of {first.loc[idx]}"
+    return out
+
+
+def mark_constant(ledger: pd.DataFrame) -> pd.DataFrame:
+    """Give each pair ONE free flat-prediction baseline: ranked, no slot spent.
+
+    Run AFTER mark_duplicates, or re-dragging the same mean file would look
+    like a second distinct baseline and start costing slots.
+
+    One rather than unlimited because a ranked freebie is a run at the
+    calibration board -- predict the mean, bet an MA-RAE of 1.0, be nearly
+    perfectly calibrated. One is a fair reference point; unlimited is a
+    strategy. A pair's second flat file is an ordinary submission and pays for
+    itself.
+    """
+    out = ledger.copy()
+    out["free"] = False
+    if "constant" not in out.columns:
+        return out
+    flat = (out["status"] == "scored") & (out["constant"] == True)  # noqa: E712
+    if not flat.any():
+        return out
+
+    order = out[flat].sort_values(["prepared_at", "file"])
+    firsts = order.groupby("pair").head(1).index
+    out.loc[firsts, "free"] = True
+    out.loc[firsts, "status"] = "constant baseline (free)"
+    return out
+
+
 def apply_budget(ledger: pd.DataFrame, budget: int = BUDGET) -> pd.DataFrame:
     """Mark each pair's first `budget` SCORED files eligible for ranking.
 
     Rejected files never consume a slot, so a malformed file is a free retry.
+    Neither do duplicates, nor a pair's first constant baseline -- though that
+    baseline is still ranked, which is why `free` and `eligible` are separate.
+
     Recomputed every run rather than stored, so changing the budget is just a
     flag rather than a ledger migration.
     """
-    out = ledger.copy()
+    out = mark_constant(mark_duplicates(ledger))
     out["eligible"] = False
-    scored = out["status"] == "scored"
-    order = out[scored].sort_values(["pair", "prepared_at", "file"])
+
+    # the free baseline is ranked without spending anything
+    out.loc[out["free"], "eligible"] = True
+
+    paying = out["status"] == "scored"
+    order = out[paying].sort_values(["pair", "prepared_at", "file"])
     keep = order.groupby("pair").head(budget).index
     out.loc[keep, "eligible"] = True
-    out.loc[scored & ~out["eligible"], "status"] = "over budget"
+    out.loc[paying & ~out["eligible"], "status"] = "over budget"
     return out
 
 
@@ -227,8 +342,12 @@ def build_tables(ledger: pd.DataFrame, budget: int = BUDGET) -> dict:
         tables["accuracy"] = pd.DataFrame(columns=["rank", "pair", "MA-RAE"])
     else:
         best = ranked.loc[ranked.groupby("pair")["actual"].idxmin()].copy()
-        used = ranked.groupby("pair").size()
-        best["submissions used"] = best["pair"].map(used).astype(str) + f"/{budget}"
+        # a free baseline is ranked but spends nothing, so it must not show up
+        # in the count -- a pair can be on the board having used 0 slots
+        paid = marked[marked["eligible"] & ~marked["free"]]
+        used = paid.groupby("pair").size()
+        best["submissions used"] = (best["pair"].map(used).fillna(0)
+                                    .astype(int).astype(str) + f"/{budget}")
         best = best.sort_values("actual").reset_index(drop=True)
         best.insert(0, "rank", best.index + 1)
         tables["accuracy"] = best.reindex(columns=(
@@ -300,20 +419,82 @@ def write_sheet(client, sheet_id: str, tables: dict) -> None:
         book.del_worksheet(existing["Sheet1"])
 
 
+# --------------------------------------------------------------------- xlsx
+
+def write_xlsx(path: str, tables: dict) -> None:
+    """Write every tab to one .xlsx, for when the Sheets API is unavailable.
+
+    A Workspace admin can block Colab's OAuth consent ("your institution's
+    admin needs to review third-party authored notebook code"), which kills
+    write_sheet but not the Drive mount. Dropping the workbook straight into
+    the shared folder needs no credentials at all: Drive previews it in the
+    Sheets viewer, so students click one file and see the same tabs.
+
+    Written to a temporary file and moved into place, so a half-written
+    workbook is never what Drive picks up to sync.
+    """
+    try:
+        import openpyxl  # noqa: F401
+    except ImportError:
+        raise SystemExit("write_xlsx needs openpyxl: pip install openpyxl")
+
+    folder = os.path.dirname(os.path.abspath(path))
+    os.makedirs(folder, exist_ok=True)
+    # keep the .xlsx extension on the temp name -- pandas picks its writer
+    # from the extension and rejects anything else
+    stem, ext = os.path.splitext(os.path.basename(path))
+    tmp = os.path.join(folder, f".{stem}.tmp{ext or '.xlsx'}")
+
+    with pd.ExcelWriter(tmp, engine="openpyxl") as writer:
+        for title, df in tables.items():
+            # Excel caps tab names at 31 characters; ours are shorter, but a
+            # renamed endpoint should degrade rather than raise.
+            body = df.copy()
+            for col in body.columns:
+                if body[col].dtype.kind == "f":
+                    body[col] = body[col].round(4)
+            body.to_excel(writer, sheet_name=title[:31], index=False)
+
+            ws = writer.sheets[title[:31]]
+            ws.freeze_panes = "A2"
+            for i, col in enumerate(body.columns, start=1):
+                seen = body[col].astype(str)
+                width = max([len(str(col))] + [len(v) for v in seen]) + 2
+                ws.column_dimensions[ws.cell(1, i).column_letter].width = min(width, 40)
+            print(f"  wrote {title[:31]:22s} {len(df):4d} row(s)")
+
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        # some Drive FUSE mounts refuse rename; fall back to a direct copy
+        import shutil
+        shutil.copyfile(tmp, path)
+        os.remove(tmp)
+    print(f"workbook: {path}")
+
+
 # ---------------------------------------------------------------------- main
 
 def run(submissions: str, truth_path: str, sheet_id: str | None = None,
         ledger_path: str | None = None, budget: int = BUDGET,
-        client=None) -> dict:
-    """Score the folder and (unless dry) publish. Returns the tables."""
+        client=None, xlsx_path: str | None = None) -> dict:
+    """Score the folder and (unless dry) publish. Returns the tables.
+
+    Publishing to a Sheet (sheet_id) and to a workbook (xlsx_path) are
+    independent: pass either, both, or neither.
+    """
     truth = load_truth(truth_path)
     print(f"truth: {len(truth)} molecules\nscoring {submissions}")
 
     ledger = score_folder(submissions, truth, ledger_path)
     tables = build_tables(ledger, budget)
 
+    if xlsx_path:
+        print("\nwriting workbook:")
+        write_xlsx(xlsx_path, tables)
+
     if sheet_id is None:
-        print("\n-- dry run, nothing published --")
+        print("\n-- no sheet id, nothing published to Sheets --")
         for title, df in tables.items():
             if title in ("submissions", "accuracy", "calibration"):
                 print(f"\n### {title} ({len(df)} rows)")
@@ -332,6 +513,53 @@ def run(submissions: str, truth_path: str, sheet_id: str | None = None,
     return tables
 
 
+def watch(submissions: str, truth_path: str, every_minutes: float = 10.0,
+          passes: int | None = None, **kwargs) -> dict:
+    """Re-run `run` every `every_minutes` until you interrupt the cell.
+
+    Any keyword `run` takes is passed straight through. Each pass is
+    incremental, so a quiet pass costs one directory listing.
+
+    A transient API error is printed and swallowed rather than ending the
+    event -- an expired token or a Sheets hiccup at 14:00 should not mean the
+    leaderboard is dead until someone notices. Interrupt (the stop button in
+    Colab) to stop; `passes` caps the count instead, which is what the tests
+    use.
+    """
+    tables: dict = {}
+    n = 0
+    print(f"auto-refresh every {every_minutes:g} min -- interrupt to stop")
+    while passes is None or n < passes:
+        n += 1
+        print(f"\n===== pass {n} at {datetime.now().strftime('%H:%M:%S')} =====")
+        ok = False
+        try:
+            tables = run(submissions, truth_path, **kwargs)
+            ok = True
+        except KeyboardInterrupt:
+            print("\nstopped after the run.")
+            break
+        except Exception:
+            traceback.print_exc()
+            print("!! that pass failed -- carrying on to the next one")
+
+        # only summarise a pass that actually ran, or a failure would report
+        # the previous pass's numbers as if they were fresh
+        accuracy = tables.get("accuracy") if ok else None
+        if accuracy is not None and len(accuracy):
+            print(f"    {len(accuracy)} pair(s) ranked, "
+                  f"best MA-RAE {accuracy['MA-RAE'].min():.4f}")
+
+        if passes is not None and n >= passes:
+            break
+        try:
+            time.sleep(every_minutes * 60)
+        except KeyboardInterrupt:
+            print("\nstopped while waiting.")
+            break
+    return tables
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -341,16 +569,27 @@ if __name__ == "__main__":
                     help="CSV of unblinded test labels -- keep this private")
     ap.add_argument("--sheet-id", default=None,
                     help="Google Sheet id from its URL. Omit for a dry run.")
+    ap.add_argument("--xlsx", default=None,
+                    help="also write every tab to this .xlsx. Needs no "
+                         "credentials -- drop it in the shared folder and "
+                         "Drive previews it in the Sheets viewer.")
     ap.add_argument("--ledger", default=None,
                     help="where to remember what has been scored "
                          "(default: alongside --truth)")
     ap.add_argument("--budget", type=int, default=BUDGET)
+    ap.add_argument("--watch", type=float, default=None, metavar="MINUTES",
+                    help="keep re-scoring and republishing this often, "
+                         "until interrupted")
     ap.add_argument("--dry-run", action="store_true",
                     help="score and print, publish nothing")
     a = ap.parse_args()
 
     ledger = a.ledger or os.path.join(os.path.dirname(os.path.abspath(a.truth)),
                                       "leaderboard_ledger.csv")
-    run(a.submissions, a.truth,
-        sheet_id=None if a.dry_run else a.sheet_id,
-        ledger_path=ledger, budget=a.budget)
+    opts = dict(sheet_id=None if a.dry_run else a.sheet_id,
+                ledger_path=ledger, budget=a.budget,
+                xlsx_path=None if a.dry_run else a.xlsx)
+    if a.watch:
+        watch(a.submissions, a.truth, every_minutes=a.watch, **opts)
+    else:
+        run(a.submissions, a.truth, **opts)
